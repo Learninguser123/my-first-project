@@ -1,0 +1,212 @@
+name: Deploy Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      version:
+        description: 'Version to deploy'
+        required: false
+        type: string
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Environment-specific deployment
+  deploy:
+    name: Deploy to ${{ inputs.environment || 'staging' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Kubernetes
+        run: |
+          # Configure kubectl
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          
+          # Set environment variables
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          IMAGE_TAG="${{ steps.meta.outputs.tags }}"
+          
+          # Update deployment with new image
+          sed -i "s|image: .*hvv-mobility.*|image: $IMAGE_TAG|g" k8s/deployment.yml
+          
+          # Apply namespace if it doesn't exist
+          kubectl create namespace hvv-$ENVIRONMENT --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy application
+          kubectl apply -f k8s/ -n hvv-$ENVIRONMENT
+          
+          # Wait for rollout
+          kubectl rollout status deployment/hvv-mobility -n hvv-$ENVIRONMENT --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          # Wait for deployment to be ready
+          sleep 60
+          
+          # Get service URL
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          if [ "$ENVIRONMENT" = "production" ]; then
+            SERVICE_URL="https://api.hvv-mobility.de"
+          else
+            SERVICE_URL="https://staging-api.hvv-mobility.de"
+          fi
+          
+          # Run smoke tests
+          npm install -g newman
+          newman run tests/postman/smoke-tests.json --env-var "baseUrl=$SERVICE_URL"
+
+      - name: Update monitoring
+        run: |
+          # Notify monitoring systems
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d "{
+              \"title\": \"HVV Mobility Deployed\",
+              \"text\": \"Version ${{ steps.meta.outputs.version }} deployed to ${{ inputs.environment || 'staging' }}\",
+              \"tags\": [\"deploy\", \"${{ inputs.environment || 'staging' }}\"]
+            }"
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          text: |
+            Deployment ${{ job.status }} for HVV Mobility
+            Environment: ${{ inputs.environment || 'staging' }}
+            Version: ${{ steps.meta.outputs.version }}
+            Commit: ${{ github.sha }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Database Migration
+  migrate:
+    name: Database Migration
+    runs-on: ubuntu-latest
+    needs: deploy
+    environment: ${{ inputs.environment || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run database migrations
+        run: |
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          if [ "$ENVIRONMENT" = "production" ]; then
+            DATABASE_URL="${{ secrets.PROD_DATABASE_URL }}"
+          else
+            DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}"
+          fi
+          
+          npm run db:migrate
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+
+  # Rollback on failure
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy, migrate]
+    if: failure()
+    environment: ${{ inputs.environment || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Rollback deployment
+        run: |
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          kubectl rollout undo deployment/hvv-mobility -n hvv-$ENVIRONMENT
+          kubectl rollout status deployment/hvv-mobility -n hvv-$ENVIRONMENT --timeout=300s
+
+      - name: Notify rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: 'failure'
+          channel: '#deployments'
+          text: |
+            🚨 ROLLBACK TRIGGERED
+            Environment: ${{ inputs.environment || 'staging' }}
+            Commit: ${{ github.sha }}
+            Reason: Deployment or migration failed
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

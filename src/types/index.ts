@@ -180,9 +180,28 @@ export interface Booking {
   currency: string;
   paymentStatus: PaymentStatus;
   passengers: number;
+  pointsEarned?: number;
   specialRequests?: string[];
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface CreateBookingRequest {
+  userId: string;
+  routeId: string;
+  startTime: Date;
+  endTime: Date;
+  totalPrice: number;
+  currency: string;
+  passengers: number;
+  specialRequests?: string[];
+}
+
+export interface UpdateBookingRequest {
+  status?: BookingStatus;
+  paymentStatus?: PaymentStatus;
+  pointsEarned?: number;
+  specialRequests?: string[];
 }
 
 export enum BookingStatus {

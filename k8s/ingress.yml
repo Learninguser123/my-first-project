@@ -1,0 +1,324 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hvv-mobility-ingress
+  labels:
+    app: hvv-mobility
+  annotations:
+    # NGINX Ingress Controller annotations
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Rate limiting
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    
+    # CORS settings
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://hvv-mobility.de,https://www.hvv-mobility.de"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type, Accept, Origin, User-Agent, DNT, Cache-Control, X-Mx-ReqToken, Keep-Alive, X-Requested-With, If-Modified-Since"
+    
+    # Large request body support for file uploads
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    
+    # Custom error pages
+    nginx.ingress.kubernetes.io/custom-http-errors: "404,503"
+    
+    # Connection settings
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    
+    # WebSocket support (if needed)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    
+    # Enable compression
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecRequestBodyAccess On
+      SecResponseBodyAccess On
+      SecResponseBodyMimeType text/plain text/html text/xml application/json
+      SecResponseBodyLimit 1048576
+    
+    # Logging
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+    nginx.ingress.kubernetes.io/enable-rewrite-log: "true"
+    
+    # Health checks
+    nginx.ingress.kubernetes.io/healthcheck-path: "/health"
+    nginx.ingress.kubernetes.io/healthcheck-interval: "10"
+    nginx.ingress.kubernetes.io/healthcheck-timeout: "5"
+    nginx.ingress.kubernetes.io/healthcheck-threshold: "3"
+    
+    # Session affinity (if needed)
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "hvv-affinity"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    
+    # Large client headers
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    
+    # Custom server snippets
+    nginx.ingress.kubernetes.io/server-snippet: |
+      server_tokens off;
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https://api.hvv-mobility.de; frame-ancestors 'none';" always;
+      
+      # Security headers
+      more_set_headers "Server: HVV-Mobility-API/1.0";
+      
+      # Hide nginx version
+      more_clear_headers Server;
+      more_clear_headers X-Powered-By;
+      
+      # Custom error pages
+      error_page 404 /404.html;
+      error_page 500 502 503 504 /50x.html;
+      
+      # Log format
+      log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    'rt=$request_time uct="$upstream_connect_time" '
+                    'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+spec:
+  tls:
+  - hosts:
+    - api.hvv-mobility.de
+    - staging-api.hvv-mobility.de
+    secretName: hvv-mobility-tls
+  rules:
+  # Production API
+  - host: api.hvv-mobility.de
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      # API versioning
+      - path: /api/v1
+        pathType: Prefix
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      # Health endpoints
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /ready
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /metrics
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      # API documentation
+      - path: /docs
+        pathType: Prefix
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /api-docs
+        pathType: Prefix
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+  
+  # Staging API
+  - host: staging-api.hvv-mobility.de
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /ready
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+      - path: /metrics
+        pathType: Exact
+        backend:
+          service:
+            name: hvv-mobility-service
+            port:
+              number: 80
+
+---
+# Ingress for monitoring and management services
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hvv-mobility-monitoring
+  labels:
+    app: hvv-mobility
+    component: monitoring
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: hvv-monitoring-auth
+    nginx.ingress.kubernetes.io/auth-realm: "HVV Mobility Monitoring"
+spec:
+  tls:
+  - hosts:
+    - monitoring.hvv-mobility.de
+    secretName: hvv-monitoring-tls
+  rules:
+  - host: monitoring.hvv-mobility.de
+    http:
+      paths:
+      # Grafana
+      - path: /grafana
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              number: 3000
+      # Prometheus
+      - path: /prometheus
+        pathType: Prefix
+        backend:
+          service:
+            name: prometheus
+            port:
+              number: 9090
+      # Kibana (if using ELK stack)
+      - path: /kibana
+        pathType: Prefix
+        backend:
+          service:
+            name: kibana
+            port:
+              number: 5601
+
+---
+# Network Policies for additional security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hvv-mobility-netpol
+  labels:
+    app: hvv-mobility
+spec:
+  podSelector:
+    matchLabels:
+      app: hvv-mobility
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow traffic from ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Allow traffic from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Allow traffic from same namespace
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  # Allow DNS resolution
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow HTTP/HTTPS to external services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+  # Allow database connections
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow Redis connections
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+
+---
+# Certificate management with cert-manager (if available)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hvv-mobility-certificate
+  labels:
+    app: hvv-mobility
+spec:
+  secretName: hvv-mobility-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+  - api.hvv-mobility.de
+  - staging-api.hvv-mobility.de
+  - monitoring.hvv-mobility.de

@@ -1,0 +1,248 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Code Quality Checks
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Check code formatting
+        run: |
+          npx prettier --check "src/**/*.{ts,js}"
+          npx prettier --check "mobile/**/*.{ts,tsx,js,jsx}"
+
+      - name: TypeScript compilation check
+        run: npx tsc --noEmit
+
+  # Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security audit
+        run: npm audit --audit-level moderate
+
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+  # Backend Testing
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: hvv_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup test database
+        run: |
+          PGPASSWORD=testpass psql -h localhost -U postgres -d hvv_test -f database/001_initial_schema.sql
+          PGPASSWORD=testpass psql -h localhost -U postgres -d hvv_test -f database/002_create_indexes.sql
+
+      - name: Run unit tests
+        run: npm run test:coverage
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/hvv_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/hvv_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: backend
+          name: backend-coverage
+
+  # Build and Test Docker Image
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    needs: [code-quality, backend-tests]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: hvv-mobility:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          docker run -d --name hvv-test -p 3000:3000 \
+            -e NODE_ENV=test \
+            -e DATABASE_URL=postgresql://postgres:testpass@localhost:5432/hvv_test \
+            hvv-mobility:test
+          
+          # Wait for service to start
+          sleep 30
+          
+          # Basic health check
+          curl -f http://localhost:3000/health || exit 1
+          
+          docker stop hvv-test
+
+  # Performance Testing
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start application
+        run: |
+          npm run build
+          npm start &
+          sleep 30
+
+      - name: Run Lighthouse CI
+        run: |
+          npm install -g @lhci/cli@0.12.x
+          lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+  # Documentation
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check README exists and is updated
+        run: |
+          if [ ! -f README.md ]; then
+            echo "README.md is missing"
+            exit 1
+          fi
+          
+          # Check if README was updated in the last 30 days
+          README_AGE=$(($(date +%s) - $(git log -1 --format=%ct README.md)))
+          MAX_AGE=$((30 * 24 * 60 * 60)) # 30 days in seconds
+          
+          if [ $README_AGE -gt $MAX_AGE ]; then
+            echo "README.md is outdated (last updated $(git log -1 --format=%cr README.md))"
+          fi
+
+      - name: Generate API documentation
+        run: |
+          npm install -g swagger-jsdoc swagger-ui-express
+          node -e "
+          const swaggerJsdoc = require('swagger-jsdoc');
+          const fs = require('fs');
+          const options = {
+            definition: {
+              openapi: '3.0.0',
+              info: { title: 'HVV Mobility API', version: '1.0.0' },
+            },
+            apis: ['./src/routes/*.ts'],
+          };
+          const specs = swaggerJsdoc(options);
+          fs.writeFileSync('docs/api.json', JSON.stringify(specs, null, 2));
+          "

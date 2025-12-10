@@ -1,0 +1,282 @@
+name: Mobile App Build
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths: 
+      - 'mobile/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'mobile/**'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+        - all
+        - ios
+        - android
+      environment:
+        description: 'Build environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  # iOS Build
+  build-ios:
+    name: Build iOS App
+    runs-on: macos-latest
+    if: contains(inputs.platform, 'ios') || inputs.platform == 'all' || github.event_name == 'push' || github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli
+
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+
+      - name: Run ESLint for mobile
+        working-directory: ./mobile
+        run: npx eslint . --ext .ts,.tsx
+
+      - name: Run TypeScript check
+        working-directory: ./mobile
+        run: npx tsc --noEmit
+
+      - name: Setup EAS Build
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+          packager: npm
+
+      - name: Build iOS with EAS
+        working-directory: ./mobile
+        run: |
+          BUILD_ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          if [ "$BUILD_ENVIRONMENT" = "production" ]; then
+            BUILD_PROFILE="production"
+          else
+            BUILD_PROFILE="preview"
+          fi
+          
+          eas build --platform ios --profile $BUILD_PROFILE --non-interactive
+        env:
+          EXPO_APP_ID: ${{ secrets.EXPO_APP_ID }}
+          EXPO_APPLE_ID: ${{ secrets.EXPO_APPLE_ID }}
+          EXPO_APPLE_ID_PASSWORD: ${{ secrets.EXPO_APPLE_ID_PASSWORD }}
+
+      - name: Upload iOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: mobile/dist/
+          retention-days: 30
+
+  # Android Build
+  build-android:
+    name: Build Android App
+    runs-on: ubuntu-latest
+    if: contains(inputs.platform, 'android') || inputs.platform == 'all' || github.event_name == 'push' || github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli
+
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ./mobile
+        run: npm test -- --coverage --watchAll=false
+
+      - name: Setup EAS Build
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+          packager: npm
+
+      - name: Build Android with EAS
+        working-directory: ./mobile
+        run: |
+          BUILD_ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          if [ "$BUILD_ENVIRONMENT" = "production" ]; then
+            BUILD_PROFILE="production"
+          else
+            BUILD_PROFILE="preview"
+          fi
+          
+          eas build --platform android --profile $BUILD_PROFILE --non-interactive
+        env:
+          EXPO_APP_ID: ${{ secrets.EXPO_APP_ID }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload Android build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: mobile/dist/
+          retention-days: 30
+
+  # Mobile Testing
+  mobile-tests:
+    name: Mobile Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: ./mobile
+        run: npm test -- --coverage --watchAll=false
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./mobile/coverage/lcov.info
+          flags: mobile
+          name: mobile-coverage
+
+      - name: Run Detox tests
+        working-directory: ./mobile
+        run: |
+          npm install -g detox-cli
+          detox build --configuration ios.sim.debug
+          detox test --configuration ios.sim.debug --cleanup
+
+  # Security Scan for Mobile
+  mobile-security:
+    name: Mobile Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+
+      - name: Run npm audit
+        working-directory: ./mobile
+        run: npm audit --audit-level moderate
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.7.0
+        with:
+          target: 'http://localhost:19006'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+  # Deploy to App Stores (on main branch)
+  deploy-stores:
+    name: Deploy to App Stores
+    runs-on: ubuntu-latest
+    needs: [build-ios, build-android]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli
+
+      - name: Submit to App Stores
+        working-directory: ./mobile
+        run: |
+          eas submit --platform all --profile production --non-interactive
+        env:
+          EXPO_APP_ID: ${{ secrets.EXPO_APP_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: 'success'
+          channel: '#mobile'
+          text: |
+            🚀 Mobile apps deployed to stores!
+            Commit: ${{ github.sha }}
+            Platforms: iOS & Android
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
